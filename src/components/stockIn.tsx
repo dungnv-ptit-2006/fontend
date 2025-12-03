@@ -1,12 +1,15 @@
 // StockInManagement.tsx
 import React, { useState, useEffect } from 'react';
 import './stockin.css';
+import axios from 'axios';
+import { v4 as uuidv4 } from "uuid";
 import {
 
   FaCheck,
   FaExclamationTriangle,
   FaTimes,
-
+  FaSpinner,
+  FaTrash,
   FaEye,
   FaChevronLeft,
   FaChevronRight,
@@ -14,6 +17,12 @@ import {
 } from 'react-icons/fa';
 
 // Types
+interface Supplier {
+  supplier_id: number;
+  name: string;
+}
+
+
 interface StockInOrder {
   stock_in_order_id: number;
   supplier_name: string;
@@ -27,7 +36,7 @@ interface StockInOrder {
 
 interface StockInItem {
   product_id: number;
-  product_name: string;
+  product_name?: string;
   product_sku: string;
   quantity: number;
   unit_cost: number;
@@ -41,7 +50,7 @@ interface StockInOrderDetail extends StockInOrder {
 interface Product {
   product_id: number;
   name: string;
-  sku: string;
+  sku?: string;
   current_cost_price: number;
   stock_quantity: number;
 }
@@ -118,6 +127,30 @@ class StockInService {
       }
     };
   }
+async getAllProducts(): Promise<Product[]> {
+  const token = localStorage.getItem('auth_token');
+  if (!token) throw new Error('Chưa đăng nhập');
+
+  const response = await fetch('http://localhost:5000/api/products', {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`);
+  }
+
+  const result = await response.json();
+  
+  // result.data.products phải là mảng
+  if (!result.data || !Array.isArray(result.data.products)) {
+    throw new Error('API trả về không phải mảng sản phẩm');
+  }
+
+  return result.data.products;
+}
+
 
   async getStockInOrderById(id: number): Promise<StockInOrderDetail> {
     const response = await fetch(`${this.baseURL}/stock-in/${id}`, {
@@ -357,7 +390,7 @@ const ProductSelect: React.FC<{
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
-
+ 
   const handleSearch = async (query: string) => {
     setSearchTerm(query);
     
@@ -429,263 +462,363 @@ const ProductSelect: React.FC<{
 };
 
 // StockIn Form Component
-const StockInForm: React.FC<{
-  onSubmit: (data: StockInFormData) => Promise<void>;
+// StockInForm.tsx
+
+
+
+// --- Types ---
+interface ProductRaw {
+  id?: number;
+  product_id?: number;
+  name?: string;
+  sku?: string;
+  price?: number;
+  unit_price?: number;
+  unitPrice?: number;
+  stock_quantity?: number;
+}
+
+interface ProductNormalized {
+  product_id: number;
+  name: string;
+  sku?: string;
+  unit_price: number;
+  stock_quantity: number;
+}
+
+interface StockItem {
+  id: string;
+  product_id: number;
+  quantity: number;
+  unit_price: number;
+  total_price: number;
+  product_name?: string;
+  product_sku?: string;
+}
+
+interface StockFormData {
+  items: StockInItem[];
+  note?: string;
+  supplier_name:string;
+  supplier_id?: number | null;
+}
+
+interface StockInFormProps {
+  onSubmit: (data: StockFormData) => Promise<void>;
   onCancel: () => void;
   loading: boolean;
-}> = ({
-  onSubmit,
-  onCancel,
-  loading,
-}) => {
-  const [formData, setFormData] = useState<StockInFormData>({
-    supplier_name: '',
-    items: [],
-    note: ''
+}
+
+// --- Helpers ---
+const toNumberSafe = (v: any, fallback = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+const normalizeProducts = (arr: ProductRaw[]): ProductNormalized[] =>
+  (arr || []).map(p => {
+    const id = p.product_id ?? p.id ?? 0;
+    const unit_price = p.unit_price ?? p.price ?? p.unitPrice ?? 0;
+    const stock_quantity = toNumberSafe(p.stock_quantity ?? 0, 0);
+    return {
+      product_id: toNumberSafe(id, 0),
+      name: p.name ?? "Unknown",
+      sku: p.sku,
+      unit_price: toNumberSafe(unit_price, 0),
+      stock_quantity,
+    };
   });
-  const [errors, setErrors] = useState<{ supplier_name?: string; items?: string }>({});
-  const [showProductSearch, setShowProductSearch] = useState(false);
 
-  const validateForm = (): boolean => {
-    const newErrors: { supplier_name?: string; items?: string } = {};
+// --- Component ---
+// --- StockInForm.tsx (sửa lại) ---
+const StockInForm: React.FC<StockInFormProps> = ({ onSubmit, onCancel, loading }) => {
+  const [products, setProducts] = useState<ProductNormalized[]>([]);
+  const [items, setItems] = useState<StockItem[]>([]);
+  const [note, setNote] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
-    if (!formData.supplier_name.trim()) {
-      newErrors.supplier_name = 'Vui lòng nhập tên nhà cung cấp';
-    }
+  const [supplierName, setSupplierName] = useState<string>("");
+  const [selectedSupplierId, setSelectedSupplierId] = useState<number | null>(null);
+  const [suppliers, setSuppliers] = useState<Supplier[]>([]);
+  const [isNewSupplier, setIsNewSupplier] = useState(false);
 
-    if (formData.items.length === 0) {
-      newErrors.items = 'Vui lòng thêm ít nhất một sản phẩm';
-    }
+  // Load suppliers
+  useEffect(() => {
+    const fetchSuppliers = async () => {
+      try {
+        const token = localStorage.getItem("auth_token");
+        const res = await fetch("http://localhost:5000/api/suppliers", {
+          headers: { Authorization: token ? `Bearer ${token}` : "" }
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        setSuppliers(data.data?.suppliers || []);
+      } catch (err) {
+        console.error("Không thể tải nhà cung cấp:", err);
+      }
+    };
+    fetchSuppliers();
+  }, []);
 
-    setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
+  // Load products
+  useEffect(() => {
+    const fetchProducts = async () => {
+      try {
+        const token = localStorage.getItem("auth_token");
+        const res = await fetch("http://localhost:5000/api/products", {
+          headers: { Authorization: token ? `Bearer ${token}` : "" }
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        const raw = Array.isArray(data) ? data : data.data ?? [];
+        setProducts(normalizeProducts(raw));
+      } catch (err) {
+        console.error("Không thể tải sản phẩm:", err);
+      }
+    };
+    fetchProducts();
+  }, []);
+
+  // Tính subtotal
+  const subTotal = items.reduce((acc, it) => acc + (it.total_price || 0), 0);
+  const createSupplier = async (name: string): Promise<number> => {
+  const token = localStorage.getItem("auth_token");
+  const res = await fetch("http://localhost:5000/api/suppliers", {
+    method: "POST",
+    headers: { 
+      "Content-Type": "application/json",
+      Authorization: token ? `Bearer ${token}` : "" 
+    },
+    body: JSON.stringify({ name }),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.success) throw new Error(data.message || "Tạo nhà cung cấp thất bại");
+  return data.data.supplier_id;
+};
+
+  const handleAddItem = () => {
+    if (!products.length) return alert("Chưa có sản phẩm trong hệ thống");
+    const p = products[0];
+    setItems(prev => [
+      ...prev,
+      {
+        id: uuidv4(),
+        product_id: p.product_id,
+        quantity: 1,
+        unit_price: p.unit_price,
+        total_price: p.unit_price,
+        product_name: p.name,
+        product_sku: p.sku,
+      },
+    ]);
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    
-    if (!validateForm()) {
+  const handleRemoveItem = (id: string) => setItems(prev => prev.filter(i => i.id !== id));
+
+  const handleItemChange = (id: string, field: "product_id" | "quantity", rawValue: any) => {
+    setItems(prev =>
+      prev.map(item => {
+        if (item.id !== id) return item;
+        const copy = { ...item };
+        if (field === "product_id") {
+          const chosen = products.find(p => p.product_id === Number(rawValue));
+          if (chosen) {
+            copy.product_id = chosen.product_id;
+            copy.product_name = chosen.name;
+            copy.product_sku = chosen.sku;
+            copy.unit_price = chosen.unit_price;
+            copy.quantity = Math.min(copy.quantity || 1, chosen.stock_quantity);
+            copy.total_price = copy.unit_price * copy.quantity;
+          }
+        } else if (field === "quantity") {
+          const chosen = products.find(p => p.product_id === copy.product_id);
+          const qty = Math.min(Math.max(1, Number(rawValue)), chosen?.stock_quantity ?? Infinity);
+          copy.quantity = qty;
+          copy.total_price = copy.unit_price * qty;
+        }
+        return copy;
+      })
+    );
+  };
+
+  // Submit
+const handleSubmit = async (e: React.FormEvent) => {
+  e.preventDefault();
+
+  if (!supplierName.trim()) {
+    alert("Nhà cung cấp là bắt buộc");
+    return;
+  }
+  if (!items.length) {
+    alert("Vui lòng thêm ít nhất 1 sản phẩm");
+    return;
+  }
+
+  setSubmitting(true);
+  try {
+    // Khai báo một lần
+let supplier_id = selectedSupplierId;
+
+// Nếu là nhà cung cấp mới, gọi API tạo mới
+if (!supplier_id) {
+  const token = localStorage.getItem("auth_token");
+  const res = await fetch("http://localhost:5000/api/suppliers", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: token ? `Bearer ${token}` : "",
+    },
+    body: JSON.stringify({ name: supplierName.trim() }),
+  });
+
+  if (!res.ok) throw new Error("Tạo nhà cung cấp thất bại");
+
+  const data = await res.json();
+  supplier_id = data.data?.supplier_id ?? null; // Gán lại, không khai báo mới
+}
+
+
+    if (!supplier_id) {
+      alert("Vui lòng chọn hoặc tạo nhà cung cấp trước khi tạo phiếu nhập");
+      setSubmitting(false);
       return;
     }
 
-    try {
-      await onSubmit(formData);
-    } catch (error) {
-      console.error('Form submission error:', error);
-    }
-  };
+  const payload: StockFormData = {
+  supplier_name: supplierName.trim(),
+  items: items.map(i => ({
+    product_id: i.product_id,
+    product_name: i.product_name || "Unknown",
+    product_sku: i.product_sku || "N/A",
+    quantity: i.quantity,
+    unit_cost: i.unit_price,
+    total_price: i.total_price,
+  })),
+};
 
-  const handleAddProduct = (product: Product) => {
-    const newItem: StockInItem = {
-      product_id: product.product_id,
-      product_name: product.name,
-      product_sku: product.sku,
-      quantity: 1,
-      unit_cost: product.current_cost_price || 0,
-      total_price: product.current_cost_price || 0
-    };
+// nếu cần, thêm supplier_id
+(payload as any).supplier_id = supplier_id;
 
-    setFormData(prev => ({
-      ...prev,
-      items: [...prev.items, newItem]
-    }));
-    
-    setShowProductSearch(false);
-    if (errors.items) {
-      setErrors(prev => ({ ...prev, items: undefined }));
-    }
-  };
 
-  const handleRemoveItem = (index: number) => {
-    setFormData(prev => ({
-      ...prev,
-      items: prev.items.filter((_, i) => i !== index)
-    }));
-  };
 
-  const handleItemChange = (index: number, field: keyof StockInItem, value: number) => {
-    setFormData(prev => ({
-      ...prev,
-      items: prev.items.map((item, i) => {
-        if (i === index) {
-          const updatedItem = { ...item, [field]: value };
-          
-          if (field === 'quantity' || field === 'unit_cost') {
-            updatedItem.total_price = updatedItem.quantity * updatedItem.unit_cost;
-          }
-          
-          return updatedItem;
-        }
-        return item;
-      })
-    }));
-  };
+    await onSubmit(payload);
 
-  const calculateTotal = () => {
-    return formData.items.reduce((sum, item) => sum + item.total_price, 0);
-  };
+    // Reset form
+    setItems([]);
+    setNote("");
+    setSupplierName("");
+    setSelectedSupplierId(null);
 
-  const isFormValid = formData.supplier_name.trim() && formData.items.length > 0;
+  } catch (err: any) {
+    console.error("Error creating order:", err);
+    alert(err?.message ?? "Lỗi server khi tạo phiếu nhập");
+  } finally {
+    setSubmitting(false);
+  }
+};
+
+
 
   return (
-    <div className="stockin-card">
-      <div className="stockin-card-header">
-        <h5 className="stockin-card-title">Tạo phiếu nhập kho mới</h5>
-      </div>
-      <div className="stockin-card-body">
-        <form onSubmit={handleSubmit}>
-          <div className="form-group">
-            <label htmlFor="supplier_name" className="form-label">
-              Tên nhà cung cấp <span className="required">*</span>
-            </label>
+    <div className="stockin-form-wrapper">
+      <form onSubmit={handleSubmit} className="stockin-form">
+        <div className="form-group">
+          <label>Nhà cung cấp</label>
+          <select
+            value={selectedSupplierId ?? ""}
+            onChange={e => {
+              const val = e.target.value;
+              if (val === "new") {
+                setIsNewSupplier(true);
+                setSelectedSupplierId(null);
+                setSupplierName("");
+              } else {
+                setIsNewSupplier(false);
+                setSelectedSupplierId(Number(val));
+                const sup = suppliers.find(s => s.supplier_id === Number(val));
+                setSupplierName(sup?.name || "");
+              }
+            }}
+          >
+            <option value="">-- Chọn nhà cung cấp --</option>
+            {suppliers.map(s => (
+              <option key={s.supplier_id} value={s.supplier_id}>{s.name}</option>
+            ))}
+            <option value="new">+ Thêm nhà cung cấp mới</option>
+          </select>
+
+          {isNewSupplier && (
             <input
               type="text"
-              className={`form-input ${errors.supplier_name ? 'error' : ''}`}
-              id="supplier_name"
-              value={formData.supplier_name}
-              onChange={(e) => {
-                setFormData(prev => ({ ...prev, supplier_name: e.target.value }));
-                if (errors.supplier_name) {
-                  setErrors(prev => ({ ...prev, supplier_name: undefined }));
-                }
-              }}
-              placeholder="Nhập tên nhà cung cấp..."
-              disabled={loading}
+              value={supplierName}
+              onChange={e => setSupplierName(e.target.value)}
+              placeholder="Nhập tên nhà cung cấp mới"
+              required
             />
-            {errors.supplier_name && <div className="error-message">{errors.supplier_name}</div>}
-          </div>
-
-          <div className="form-group">
-            <label className="form-label">Danh sách sản phẩm nhập</label>
-            
-            {!showProductSearch ? (
-              <button
-                type="button"
-                className="add-product-btn"
-                onClick={() => setShowProductSearch(true)}
-                disabled={loading}
-              >
-                 <FaPlus /> Thêm sản phẩm
-              </button>
-            ) : (
-              <ProductSelect onProductSelect={handleAddProduct} disabled={loading} />
-            )}
-            
-            {errors.items && <div className="error-message">{errors.items}</div>}
-          </div>
-
-          {formData.items.length > 0 ? (
-            <div className="items-section">
-              <h6>Danh sách sản phẩm</h6>
-              <div className="items-table">
-                <table className="stockin-items-table">
-                  <thead>
-                    <tr>
-                      <th>Sản phẩm</th>
-                      <th>SKU</th>
-                      <th>Số lượng</th>
-                      <th>Đơn giá</th>
-                      <th>Thành tiền</th>
-                      <th>Thao tác</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {formData.items.map((item, index) => (
-                      <tr key={index}>
-                        <td>{item.product_name}</td>
-                        <td>{item.product_sku}</td>
-                        <td>
-                          <input
-                            type="number"
-                            min="1"
-                            className="form-input small"
-                            value={item.quantity}
-                            onChange={(e) => handleItemChange(index, 'quantity', parseInt(e.target.value) || 1)}
-                            disabled={loading}
-                          />
-                        </td>
-                        <td>
-                          <input
-                            type="number"
-                            min="0"
-                            step="0.01"
-                            className="form-input small"
-                            value={item.unit_cost}
-                            onChange={(e) => handleItemChange(index, 'unit_cost', parseFloat(e.target.value) || 0)}
-                            disabled={loading}
-                          />
-                        </td>
-                        <td>{formatCurrency(item.total_price)}</td>
-                        <td>
-                          <button
-                            type="button"
-                            className="btn-danger small"
-                            onClick={() => handleRemoveItem(index)}
-                            disabled={loading}
-                          >
-                            <FaTimes />
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              
-              <div className="total-section">
-                <div className="total-label">Tổng cộng:</div>
-                <div className="total-amount">{formatCurrency(calculateTotal())}</div>
-              </div>
-            </div>
-          ) : (
-            <div className="empty-state-large">
-              <p className="empty-text">Chưa có sản phẩm nào.</p>
-              <p>Nhấn "Thêm sản phẩm" để bắt đầu.</p>
-            </div>
           )}
+        </div>
 
-          <div className="form-group">
-            <label htmlFor="note" className="form-label">Ghi chú</label>
-            <textarea
-              className="form-input"
-              id="note"
-              rows={3}
-              value={formData.note}
-              onChange={(e) => setFormData(prev => ({ ...prev, note: e.target.value }))}
-              placeholder="Thêm ghi chú cho phiếu nhập kho (tùy chọn)..."
-              disabled={loading}
-            />
-          </div>
+        {/* Các phần thêm sản phẩm giống cũ */}
+        <div className="order-items-header">
+          <h4>Sản phẩm</h4>
+          <button type="button" onClick={handleAddItem} disabled={loading || submitting || !products.length}>
+            <FaPlus /> Thêm sản phẩm
+          </button>
+        </div>
 
-          <div className="form-actions">
-            <button
-              type="button"
-              className="btn-secondary"
-              onClick={onCancel}
-              disabled={loading}
-            >
-              Hủy
-            </button>
-            <button
-              type="submit"
-              className="btn-primary"
-              disabled={loading || !isFormValid}
-            >
-              {loading ? (
-                <>
-                  <span className="spinner"></span>
-                  Đang xử lý...
-                </>
-              ) : (
-                'Tạo phiếu nhập'
-              )}
-            </button>
-          </div>
-        </form>
-      </div>
+        <div className="order-items-scroll">
+          {items.map(item => (
+            <div className="order-item-row" key={item.id}>
+              <select
+                value={item.product_id}
+                onChange={e => handleItemChange(item.id, "product_id", Number(e.target.value))}
+                disabled={loading || submitting}
+              >
+                {products.map(p => (
+                  <option key={p.product_id} value={p.product_id}>
+                    {p.name} ({p.sku ?? "N/A"}) - {formatCurrency(p.unit_price)} - Tồn kho: {p.stock_quantity}
+                  </option>
+                ))}
+              </select>
+
+              <input
+                type="number"
+                min={1}
+                value={item.quantity}
+                onChange={e => handleItemChange(item.id, "quantity", Number(e.target.value))}
+                disabled={loading || submitting}
+              />
+
+              <div className="price">{formatCurrency(item.total_price)}</div>
+
+              <button type="button" onClick={() => handleRemoveItem(item.id)} disabled={loading || submitting}>
+                <FaTrash />
+              </button>
+            </div>
+          ))}
+
+          {items.length === 0 && <div className="empty-note">Chưa có sản phẩm. Bấm "Thêm sản phẩm" để bắt đầu.</div>}
+        </div>
+
+        <div className="order-summary">
+          <div>Tổng cộng: <strong>{formatCurrency(subTotal)}</strong></div>
+        </div>
+
+        <div className="form-actions">
+          <button type="button" onClick={onCancel} disabled={loading || submitting}>
+            Hủy
+          </button>
+          <button type="submit" disabled={loading || submitting}>
+            {submitting ? <><FaSpinner className="spinner-small" /> Đang xử lý...</> : "Nhập kho"}
+          </button>
+        </div>
+      </form>
     </div>
   );
 };
+
+
+
 
 // StockIn Details Component
 const StockInDetails: React.FC<{
@@ -1062,7 +1195,6 @@ const StockInManagement: React.FC = () => {
               onChange={(e) => setSearchTerm(e.target.value)}
               disabled={loading}
             />
-           
           </div>
         </form>
       </div>
