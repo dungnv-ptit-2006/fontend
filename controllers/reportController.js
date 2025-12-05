@@ -1,0 +1,183 @@
+const { pool } = require('../config/database');
+
+const reportController = {
+  // Báo cáo doanh thu
+  getSalesReport: async (req, res) => {
+    try {
+      const { period = 'daily', date_from, date_to } = req.query;
+      let dateFormat;
+      
+      switch (period) {
+        case 'daily':
+          dateFormat = '%Y-%m-%d';
+          break;
+        case 'weekly':
+          dateFormat = '%Y-%u';
+          break;
+        case 'monthly':
+          dateFormat = '%Y-%m';
+          break;
+        default:
+          dateFormat = '%Y-%m-%d';
+      }
+
+      let whereClause = "WHERE order_status != 'cancelled'";
+      const params = [];
+
+      if (date_from) {
+        whereClause += ' AND DATE(created_at) >= ?';
+        params.push(date_from);
+      }
+
+      if (date_to) {
+        whereClause += ' AND DATE(created_at) <= ?';
+        params.push(date_to);
+      }
+
+      // FIX: Dùng string literal và GROUP BY alias
+      const query = `
+        SELECT
+          DATE_FORMAT(created_at, '${dateFormat}') as period,
+          COUNT(*) as total_orders,
+          SUM(final_amount) as total_revenue,
+          AVG(final_amount) as avg_order_value,
+          COUNT(CASE WHEN payment_status = 'paid' THEN 1 END) as paid_orders,
+          COUNT(CASE WHEN order_status = 'completed' THEN 1 END) as completed_orders
+        FROM orders
+        ${whereClause}
+        GROUP BY period
+        ORDER BY period DESC 
+        LIMIT 30
+      `;
+
+      const [rows] = await pool.execute(query, params);
+
+      res.json({
+        success: true,
+        data: { reports: rows },
+        period,
+        total: rows.length
+      });
+    } catch (error) {
+      console.error('Get sales report error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Lỗi server khi lấy báo cáo doanh thu'
+      });
+    }
+  },
+
+  // Báo cáo sản phẩm bán chạy
+getTopProducts: async (req, res) => {
+  try {
+    let { limit = 10, date_from, date_to } = req.query;
+
+    // FIX: convert to number safely
+    limit = Number(limit);
+    if (!limit || limit < 1) limit = 10;
+
+    let query = `
+      SELECT
+        p.product_id,
+        p.name,
+        p.sku,
+        SUM(oi.quantity) as total_sold,
+        SUM(oi.total_price) as total_revenue,
+        COUNT(DISTINCT oi.order_id) as total_orders
+      FROM order_items oi
+      JOIN products p ON oi.product_id = p.product_id
+      JOIN orders o ON oi.order_id = o.order_id
+      WHERE o.order_status = 'completed'
+    `;
+
+    const params = [];
+
+    if (date_from) {
+      query += ` AND DATE(o.created_at) >= ?`;
+      params.push(date_from);
+    }
+
+    if (date_to) {
+      query += ` AND DATE(o.created_at) <= ?`;
+      params.push(date_to);
+    }
+
+    // FIX: không dùng LIMIT ?
+    query += `
+      GROUP BY p.product_id, p.name, p.sku
+      ORDER BY total_sold DESC
+      LIMIT ${limit}
+    `;
+
+    console.log("SQL:", query);
+    console.log("PARAMS:", params);
+
+    const [rows] = await pool.execute(query, params);
+
+    return res.json({
+      success: true,
+      products: rows,
+      total: rows.length
+    });
+  } catch (error) {
+    console.error('Get top products error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Lỗi server khi lấy báo cáo sản phẩm bán chạy'
+    });
+  }
+}
+,
+
+  // Báo cáo tồn kho
+  getInventoryReport: async (req, res) => {
+    try {
+      const [rows] = await pool.execute(`
+        SELECT
+          p.product_id,
+          p.name,
+          p.sku,
+          p.stock_quantity,
+          p.min_stock,
+          p.max_stock,
+          p.cost_price,
+          p.price,
+          c.name as category_name,
+          s.name as supplier_name,
+          CASE
+            WHEN p.stock_quantity <= p.min_stock THEN 'low'
+            WHEN p.stock_quantity >= p.max_stock THEN 'high'
+            ELSE 'normal'
+          END as stock_status
+        FROM products p
+        LEFT JOIN categories c ON p.category_id = c.category_id
+        LEFT JOIN suppliers s ON p.supplier_id = s.supplier_id
+        WHERE p.status = 'active'
+        ORDER BY stock_status, p.stock_quantity ASC
+      `);
+      const summary = {
+        total_products: rows.length,
+        low_stock: rows.filter(p => p.stock_status === 'low').length,
+        normal_stock: rows.filter(p => p.stock_status === 'normal').length,
+        high_stock: rows.filter(p => p.stock_status === 'high').length,
+        total_inventory_value: rows.reduce((sum, p) => sum + (p.stock_quantity * p.cost_price), 0)
+      };
+
+      res.json({
+        success: true,
+        data: {
+          products: rows,
+          summary
+        }
+      });
+    } catch (error) {
+      console.error('Get inventory report error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Lỗi server khi lấy báo cáo tồn kho'
+      });
+    }
+  }
+};
+
+module.exports = reportController;
